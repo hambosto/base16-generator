@@ -42,10 +42,13 @@
         "x86_64-darwin"
         "x86_64-linux"
       ];
+
       forAllSystems = lib.genAttrs systems;
 
       # Load the uv workspace & generate overlays from uv.lock.
-      workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ./.; };
+      workspace = uv2nix.lib.workspace.loadWorkspace {
+        workspaceRoot = ./.;
+      };
 
       # Production overlay: prefer prebuilt binary wheels.
       overlay = workspace.mkPyprojectOverlay {
@@ -95,18 +98,22 @@
             lib.composeManyExtensions [
               # Build systems (uv_build) required when packages are built from source.
               pyproject-build-systems.overlays.wheel
+
               # Packages generated from uv.lock.
               overlay
+
               pyprojectOverrides
             ]
           )
       );
+
       # Per-system packages, shared between the packages & overlays outputs.
       forSystem =
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
           pythonSet = pythonSets.${system};
+
           inherit (pkgs.callPackages pyproject-nix.build.util { }) mkApplication;
         in
         {
@@ -122,21 +129,22 @@
 
       # Overlay for consumers: import into any package set, then use
       # pkgs.base16-generator & pkgs.base16-generator-application.
+      #
+      # Unsupported systems receive an empty overlay. This is necessary
+      # because Nixpkgs may evaluate additional package sets for targets
+      # such as wasm32-wasip1.
       pkgsOverlay =
         final: prev:
         let
-          # Read the system from prev.stdenv, NOT final.stdenv.
-          # Forcing final.stdenv from an overlay attribute runs into
-          # infinite recursion in the stdenv bootstrap fold.
           system = prev.stdenv.hostPlatform.system;
         in
-        assert lib.assertMsg (lib.elem system systems)
-          "base16-generator overlay: system '${system}' is not supported; \
-          supported systems: ${lib.concatStringsSep ", " systems}";
-        {
-          base16-generator = (forSystem system).default;
-          base16-generator-application = (forSystem system).application;
-        };
+        if lib.elem system systems then
+          {
+            base16-generator = (forSystem system).default;
+            base16-generator-application = (forSystem system).application;
+          }
+        else
+          { };
     in
     {
       overlays.default = pkgsOverlay;

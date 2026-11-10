@@ -1,175 +1,203 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import NamedTuple
 
 import numpy as np
+from PIL import Image
 
-from .clustering import NUM_CLUSTERS, Clustering, cluster
 from .color import (
     Array,
     enforce_contrast,
-    linear_luminance,
     oklch_to_srgb,
+    srgb_to_oklch,
+    wrap_degrees,
 )
-from .image import load_oklch
-from .variants import DARK, VARIANTS, Variant
 
-NUM_ACCENTS: Final = NUM_CLUSTERS + 1
-ZONE_MERGE_THRESHOLD: Final = 50.0
-BACKGROUND_SLOTS: Final = 4
-NEUTRAL_CHROMA_RATIO: Final = 0.5
-MAX_BACKGROUND_CHROMA: Final = 0.04
-MAX_FOREGROUND_CHROMA: Final = 0.025
-MIN_ACCENT_CHROMA: Final = 0.07
-MAX_ACCENT_CHROMA: Final = 0.16
-CHROMA_RATIO_RANGE: Final = (
-    0.6,
-    1.4,
-)
-MIN_BROWN_CHROMA: Final = 0.04
-MAX_BROWN_CHROMA: Final = 0.09
-BROWN_CHROMA_RATIO: Final = 0.5
-LIGHTNESS_FOLLOW: Final = 0.5
-MAX_LIGHTNESS_OFFSET: Final = 0.06
-CONTRAST_LIGHTNESS_SHIFT: Final = 0.08
+SLOT_HUES = np.array([29.0, 62.0, 110.0, 142.0, 195.0, 255.0, 310.0])
+NUM_SLOTS = len(SLOT_HUES)
 
-MIN_CONTRAST: Final[Array] = np.column_stack(
+VIVID_CHROMA = 0.025
+MIN_SLOT_SHARE = 0.02
+HUE_SMOOTHING = 6.0
+HUE_WINDOW = 14.0
+HARMONIZE = 12.0
+MIN_SEPARATION = 16.0
+ACCENT_CHROMA = (0.065, 0.17)
+HEADROOM = 0.9
+FALLBACK_CHROMA = 0.08
+CONTRAST_SHIFT = 0.08
+BROWN_STEP = 0.06
+
+NEUTRAL_TINT = 0.8
+NEUTRAL_CAP = np.array([0.05] * 4 + [0.03] * 4)
+RAMP = np.array([0.0, 0.055, 0.13, 0.36, 0.62, 0.85, 0.93, 1.0])
+
+MIN_CONTRAST = np.column_stack(
     [
-        [1.0, 1.0, 1.0, 3.0, 4.5, 7.0, 7.0, 7.0] + [4.5] * NUM_ACCENTS,
-        [1.0, 1.0, 1.0, 1.5, 4.5, 4.5, 4.5, 4.5] + [3.0] * NUM_ACCENTS,
+        [1.0, 1.0, 1.0, 3.0, 4.5, 7.0, 7.0, 7.0] + [4.5] * 8,
+        [1.0, 1.0, 1.0, 1.5, 4.5, 4.5, 4.5, 4.5] + [3.0] * 8,
     ]
 )
 
-LABELS: Final = tuple(f"base{i:02X}" for i in range(16))
+_EDGES = np.arange(-41.0, 42.0)
+_CENTERS = _EDGES[:-1] + 0.5
+_KERNEL = np.exp(-0.5 * (np.arange(-18, 19) / HUE_SMOOTHING) ** 2)
 
 
-def _blend(centers: Array, weights: Array) -> Array:
-    weights = weights / weights.sum()
-    rad = np.radians(centers[:, 2])
-    hue = (
-        np.degrees(
-            np.arctan2((np.sin(rad) * weights).sum(), (np.cos(rad) * weights).sum())
-        )
-        % 360.0
+class Variant(NamedTuple):
+    sign: float
+    background: tuple[float, float]
+    foreground: tuple[float, float]
+    accent_bounds: tuple[float, float]
+    fallback: tuple[float, ...]
+
+
+VARIANTS = {
+    "dark": Variant(
+        sign=1.0,
+        background=(0.28, 0.16),
+        foreground=(0.92, 0.985),
+        accent_bounds=(0.60, 0.88),
+        fallback=(0.66, 0.74, 0.85, 0.78, 0.78, 0.70, 0.70),
+    ),
+    "light": Variant(
+        sign=-1.0,
+        background=(0.94, 0.99),
+        foreground=(0.30, 0.14),
+        accent_bounds=(0.42, 0.60),
+        fallback=(0.54, 0.56, 0.54, 0.52, 0.52, 0.48, 0.48),
+    ),
+}
+
+
+def load_oklch(path: Path, resize: int) -> Array:
+    if resize < 1:
+        raise ValueError("resize must be a positive integer")
+    with Image.open(path) as image:
+        image.thumbnail((resize, resize), Image.Resampling.NEAREST)
+        rgba = np.asarray(image.convert("RGBA")).reshape(-1, 4)
+
+    visible = rgba[rgba[:, 3] >= 128, :3]
+    if len(visible) == 0:
+        raise ValueError("image has no visible pixels")
+    return srgb_to_oklch(visible)
+
+
+def _tint(pixels: Array) -> tuple[float, float]:
+    rad = np.radians(pixels[:, 2])
+    weight = pixels[:, 1]
+    hue = np.degrees(
+        np.arctan2((weight * np.sin(rad)).sum(), (weight * np.cos(rad)).sum())
     )
-    return np.array(
-        [(centers[:, 0] * weights).sum(), (centers[:, 1] * weights).sum(), hue]
+    return float(hue % 360.0), float(weight.mean())
+
+
+def build_palette(lch: Array, contrast: float, variant: Variant) -> dict[str, str]:
+    if not 0.0 <= contrast <= 1.0:
+        raise ValueError("contrast must be between 0.0 and 1.0")
+    sign = variant.sign
+
+    vivid = lch[lch[:, 1] >= VIVID_CHROMA]
+    hues = SLOT_HUES.copy()
+    shares = np.zeros(NUM_SLOTS)
+    found = np.zeros(NUM_SLOTS, dtype=bool)
+    slot_lightness = np.array(variant.fallback)
+    slot_chroma = np.full(NUM_SLOTS, FALLBACK_CHROMA)
+
+    if len(vivid):
+        offset = wrap_degrees(vivid[:, 2, None] - SLOT_HUES)
+        nearest = np.abs(offset).argmin(axis=1)
+        for k in range(NUM_SLOTS):
+            voters = nearest == k
+            shares[k] = vivid[voters, 1].sum() / vivid[:, 1].sum()
+            if shares[k] < MIN_SLOT_SHARE:
+                continue
+            histogram, _ = np.histogram(
+                offset[voters, k], bins=_EDGES, weights=vivid[voters, 1]
+            )
+            peak = _CENTERS[np.convolve(histogram, _KERNEL, mode="same").argmax()]
+            members = voters & (np.abs(offset[:, k] - peak) <= HUE_WINDOW)
+            hues[k] = SLOT_HUES[k] + np.average(
+                offset[members, k], weights=vivid[members, 1]
+            )
+            slot_lightness[k] = vivid[members, 0].mean()
+            slot_chroma[k] = vivid[members, 1].mean()
+            found[k] = True
+
+    if found.any():
+        dominant = hues[shares.argmax()]
+        for k in np.flatnonzero(~found):
+            turn = np.clip(
+                0.5 * wrap_degrees(dominant - SLOT_HUES[k]), -HARMONIZE, HARMONIZE
+            )
+            hues[k] = SLOT_HUES[k] + turn
+            slot_lightness[k] = np.median(slot_lightness[found])
+            slot_chroma[k] = np.median(slot_chroma[found])
+
+    for _ in range(3):
+        for k in range(NUM_SLOTS):
+            j = (k + 1) % NUM_SLOTS
+            gap = (hues[j] - hues[k]) % 360.0
+            if gap < MIN_SEPARATION:
+                if shares[k] < shares[j]:
+                    hues[k] -= MIN_SEPARATION - gap
+                else:
+                    hues[j] += MIN_SEPARATION - gap
+
+    hues %= 360.0
+    shift = sign * CONTRAST_SHIFT * (contrast - 0.5)
+    accents = np.empty((8, 3))
+    accents[:7, 0] = np.clip(slot_lightness + shift, *variant.accent_bounds)
+    accents[:7, 1] = np.clip(slot_chroma, *ACCENT_CHROMA)
+    accents[:7, 2] = hues
+    accents[7] = (
+        np.clip(accents[1, 0] - sign * BROWN_STEP, *variant.accent_bounds),
+        np.clip(0.5 * accents[1, 1], 0.04, 0.09),
+        hues[0] + wrap_degrees(hues[1] - hues[0]) / 2.0,
     )
 
+    median = np.median(lch[:, 0])
+    background_side = lch[(lch[:, 0] - median) * sign <= 0.0]
+    foreground_side = lch[(lch[:, 0] - median) * sign > 0.0]
+    if len(foreground_side) == 0:
+        foreground_side = lch
+    background_hue, background_chroma = _tint(background_side)
+    foreground_hue, foreground_chroma = _tint(foreground_side)
 
-def _accents(result: Clustering, contrast: float, variant: Variant) -> Array:
-    centers = result.centers
-    baseline = np.array(variant.accent_lightness)
-    low, high = variant.accent_range
-    shift = variant.direction * CONTRAST_LIGHTNESS_SHIFT * (contrast - 0.5)
-
-    mean = centers[:, 1].mean()
-    ratio = (
-        np.clip(centers[:, 1] / mean, *CHROMA_RATIO_RANGE)
-        if mean > 0
-        else np.ones(NUM_CLUSTERS)
-    )
-    target = np.clip(
-        result.mean_chroma * (1.0 + 3.0 * contrast),
-        MIN_ACCENT_CHROMA,
-        MAX_ACCENT_CHROMA,
-    )
-
-    nudge = np.clip(
-        LIGHTNESS_FOLLOW * (centers[:, 0] - centers[:, 0].mean()),
-        -MAX_LIGHTNESS_OFFSET,
-        MAX_LIGHTNESS_OFFSET,
+    low = np.interp(contrast, [0.0, 1.0], variant.background)
+    high = np.interp(contrast, [0.0, 1.0], variant.foreground)
+    neutrals = np.column_stack(
+        [
+            low + (high - low) * RAMP,
+            np.minimum(
+                NEUTRAL_TINT
+                * np.array([background_chroma] * 4 + [foreground_chroma] * 4),
+                NEUTRAL_CAP,
+            ),
+            np.array([background_hue] * 4 + [foreground_hue] * 4),
+        ]
     )
 
-    accents = np.empty((NUM_ACCENTS, 3))
-    accents[:NUM_CLUSTERS, 0] = np.clip(
-        baseline[:NUM_CLUSTERS] + nudge + shift, low, high
-    )
-    accents[:NUM_CLUSTERS, 1] = np.minimum(target * ratio, MAX_ACCENT_CHROMA)
-    accents[:NUM_CLUSTERS, 2] = centers[:, 2]
-
-    brown_hue = _blend(accents[:2], np.ones(2))[2]
-    brown_chroma = np.clip(
-        BROWN_CHROMA_RATIO * accents[1, 1], MIN_BROWN_CHROMA, MAX_BROWN_CHROMA
-    )
-    accents[NUM_CLUSTERS] = (
-        np.clip(baseline[NUM_CLUSTERS] + shift, low, high),
-        brown_chroma,
-        brown_hue,
-    )
-    return accents
-
-
-def _neutral_tints(result: Clustering, direction: float) -> tuple[Array, Array]:
-    centers, counts = result.centers, result.counts
-
-    populated = np.flatnonzero(result.populated)
-    if populated.size == 0:
-        grey = np.array([0.5, 0.0, 0.0])
-        return grey, grey
-
-    by_hue = [
-        int(k) for k in populated[np.argsort(centers[populated, 2], kind="stable")]
-    ]
-    zones = [[by_hue[0]]]
-    for k in by_hue[1:]:
-        if centers[k, 2] - centers[zones[-1][-1], 2] <= ZONE_MERGE_THRESHOLD:
-            zones[-1].append(k)
-        else:
-            zones.append([k])
-
-    seam_gap = 360.0 - centers[zones[-1][-1], 2] + centers[zones[0][0], 2]
-    if len(zones) > 1 and seam_gap <= ZONE_MERGE_THRESHOLD:
-        zones[0] = zones.pop() + zones[0]
-
-    if len(zones) == 1:
-        zone = zones[0]
-        background = _blend(centers[zone], counts[zone].astype(np.float64))
-        return background, centers[max(zone, key=lambda k: direction * centers[k, 0])]
-
-    zones.sort(key=lambda zone: counts[zone].sum(), reverse=True)
-    first, second = (
-        _blend(centers[zone], counts[zone].astype(np.float64)) for zone in zones[:2]
-    )
-    return first, first if direction * (first[0] - second[0]) > 0 else second
-
-
-def build_palette(
-    result: Clustering, contrast: float = 0.5, variant: Variant = DARK
-) -> dict[str, str]:
-    contrast = float(np.clip(contrast, 0.0, 1.0))
-    accents = _accents(result, contrast, variant)
-    background, foreground = _neutral_tints(result, variant.direction)
-
-    neutrals = np.empty((len(variant.neutral_lightness), 3))
-    for i, lightness in enumerate(variant.neutral_lightness):
-        if i < BACKGROUND_SLOTS:
-            tint, cap = background, MAX_BACKGROUND_CHROMA
-        else:
-            tint, cap = foreground, MAX_FOREGROUND_CHROMA
-        neutrals[i] = (lightness, min(tint[1] * NEUTRAL_CHROMA_RATIO, cap), tint[2])
-
-    colors = np.vstack([neutrals, accents])
-    anchors = oklch_to_srgb(colors[[0, 2]])
-    anchor_luminance = linear_luminance(anchors)
     colors = enforce_contrast(
-        colors, MIN_CONTRAST, anchor_luminance, toward=(1.0 + variant.direction) / 2.0
+        np.vstack([neutrals, accents]),
+        MIN_CONTRAST,
+        reference_rows=(0, 2),
+        toward=(1.0 + sign) / 2.0,
+        headroom=HEADROOM,
     )
 
-    palette: dict[str, str] = {}
-    for label, (r, g, b) in zip(LABELS, oklch_to_srgb(colors)):
-        palette[label] = f"{int(r):02x}{int(g):02x}{int(b):02x}"
-    return palette
+    colors[:8, 0] = sign * np.maximum.accumulate(sign * colors[:8, 0])
+    rgb = oklch_to_srgb(colors)
+
+    return {f"base{i:02X}": rgb[i].tobytes().hex() for i in range(16)}
 
 
 def generate_palette(
-    image_path: str | Path,
+    path: str | Path,
     *,
     contrast: float = 0.5,
-    resize: int | None = 256,
     variant: str = "dark",
+    resize: int = 256,
 ) -> dict[str, str]:
-    return build_palette(
-        cluster(load_oklch(Path(image_path), resize)), contrast, VARIANTS[variant]
-    )
+    return build_palette(load_oklch(Path(path), resize), contrast, VARIANTS[variant])

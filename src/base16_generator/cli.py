@@ -3,16 +3,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
-from .palette import DEFAULT_RICHNESS, VARIANTS, generate_palette
+from .palette import DEFAULT_RICHNESS, generate_palette
+from .variants import VARIANTS
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="base16-generator",
-        description="Base16 scheme from an image via OKLCH hue-sector clustering.",
+        description="Base16 scheme from an image via OKLCH hue-family clustering.",
     )
     parser.add_argument("-i", "--image", type=Path, required=True, help="path to image")
     parser.add_argument(
@@ -44,8 +45,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "-o", "--output", type=Path, help="write to file instead of stdout"
     )
-    args = parser.parse_args(argv)
+    return parser
 
+
+def _format_scheme(palette: dict[str, str], name: str) -> str:
+    scheme = {
+        "scheme": name,
+        "author": "Base16 Generator (https://github.com/hambosto/base16-generator)",
+        **{label: value.upper() for label, value in palette.items()},
+    }
+    return json.dumps(scheme, indent=2) + "\n"
+
+
+def _emit(text: str, output: Path | None) -> None:
+    if output is None:
+        sys.stdout.write(text)
+    else:
+        output.write_text(text, encoding="utf-8")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
     try:
         palette = generate_palette(
             args.image,
@@ -54,23 +74,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             richness=args.richness,
             resize=args.resize,
         )
+        _emit(_format_scheme(palette, args.name or args.image.stem), args.output)
     except (OSError, ValueError) as exc:
-        print(f"base16-generator: {exc}", file=sys.stderr)
-        return 1
-
-    scheme = {
-        "scheme": args.name or args.image.stem,
-        "author": "Base16 Generator (https://github.com/hambosto/base16-generator)",
-        **{label: value.upper() for label, value in palette.items()},
-    }
-    text = json.dumps(scheme, indent=2) + "\n"
-
-    try:
-        if args.output:
-            args.output.write_text(text, encoding="utf-8")
-        else:
-            sys.stdout.write(text)
-    except OSError as exc:
         print(f"base16-generator: {exc}", file=sys.stderr)
         return 1
     return 0

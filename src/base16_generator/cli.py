@@ -34,7 +34,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="dark",
         help="dark or light scheme (default dark)",
     )
-    parser.add_argument("-n", "--name", help="scheme name (default: image file name)")
     parser.add_argument(
         "-r",
         "--resize",
@@ -48,9 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_scheme(palette: dict[str, str], name: str) -> str:
+def _format_scheme(palette: dict[str, str], variant: str) -> str:
     scheme = {
-        "scheme": name,
+        "scheme": variant,
         "author": "Base16 Generator (https://github.com/hambosto/base16-generator)",
         **{label: value.upper() for label, value in palette.items()},
     }
@@ -74,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             richness=args.richness,
             resize=args.resize,
         )
-        _emit(_format_scheme(palette, args.name or args.image.stem), args.output)
+        _emit(_format_scheme(palette, args.variant), args.output)
     except (OSError, ValueError) as exc:
         print(f"base16-generator: {exc}", file=sys.stderr)
         return 1

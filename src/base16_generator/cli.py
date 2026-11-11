@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .palette import VARIANTS, generate_palette
+from .palette import DEFAULT_RICHNESS, VARIANTS, generate_palette
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -17,6 +17,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("-i", "--image", type=Path, required=True, help="path to image")
     parser.add_argument(
         "-c", "--contrast", type=float, default=0.5, help="0.0..1.0 (default 0.5)"
+    )
+    parser.add_argument(
+        "-s",
+        "--richness",
+        type=float,
+        default=DEFAULT_RICHNESS,
+        help="0.0 = accents exactly as the image has them, 1.0 = the typical "
+        f"lightness and chroma of well-known schemes (default {DEFAULT_RICHNESS})",
     )
     parser.add_argument(
         "-v",
@@ -43,21 +51,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.image,
             contrast=args.contrast,
             variant=args.variant,
+            richness=args.richness,
             resize=args.resize,
         )
     except (OSError, ValueError) as exc:
-        print(f"iridion: {exc}", file=sys.stderr)
+        print(f"base16-generator: {exc}", file=sys.stderr)
         return 1
 
-    lines = [
-        'system: "base16"',
-        f"name: {json.dumps(args.name or args.image.stem)}",
-        'author: "iridion"',
-        f'variant: "{args.variant}"',
-        "palette:",
-        *(f'  {label}: "{value}"' for label, value in palette.items()),
-    ]
-    text = "\n".join(lines) + "\n"
+    scheme = {
+        "scheme": args.name or args.image.stem,
+        "author": "Base16 Generator (https://github.com/hambosto/base16-generator)",
+        **{label: value.upper() for label, value in palette.items()},
+    }
+    text = json.dumps(scheme, indent=2) + "\n"
 
     try:
         if args.output:
@@ -65,7 +71,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             sys.stdout.write(text)
     except OSError as exc:
-        print(f"iridion: {exc}", file=sys.stderr)
+        print(f"base16-generator: {exc}", file=sys.stderr)
         return 1
     return 0
 

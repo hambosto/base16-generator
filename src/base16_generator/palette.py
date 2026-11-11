@@ -14,24 +14,28 @@ from .color import (
     wrap_degrees,
 )
 
-SLOT_HUES = np.array([29.0, 62.0, 110.0, 142.0, 195.0, 255.0, 310.0])
+SLOT_HUES = np.array([23.0, 54.0, 85.0, 137.0, 195.0, 247.0, 318.0])
 NUM_SLOTS = len(SLOT_HUES)
+_GAP_ABOVE = np.diff(np.append(SLOT_HUES, SLOT_HUES[0] + 360.0))
+_GAP_BELOW = np.roll(_GAP_ABOVE, 1)
+REACH = 0.75
 
 VIVID_CHROMA = 0.025
 MIN_SLOT_SHARE = 0.02
 HUE_SMOOTHING = 6.0
 HUE_WINDOW = 14.0
-HARMONIZE = 12.0
+TONE_PERCENTILE = 80.0
+PRESENT_SHARE = 0.005
 MIN_SEPARATION = 16.0
-ACCENT_CHROMA = (0.065, 0.17)
+DEFAULT_RICHNESS = 0.8
+ACCENT_CHROMA = (0.065, 0.19)
 HEADROOM = 0.9
-FALLBACK_CHROMA = 0.08
 CONTRAST_SHIFT = 0.08
-BROWN_STEP = 0.06
+BROWN_CHROMA = 0.8
 
-NEUTRAL_TINT = 0.8
-NEUTRAL_CAP = np.array([0.05] * 4 + [0.03] * 4)
-RAMP = np.array([0.0, 0.055, 0.13, 0.36, 0.62, 0.85, 0.93, 1.0])
+NEUTRAL_TINT = 1.0
+NEUTRAL_CAP = np.array([0.045] * 4 + [0.035] * 4)
+RAMP = np.array([0.0, 0.08, 0.19, 0.38, 0.62, 0.82, 0.92, 1.0])
 
 MIN_CONTRAST = np.column_stack(
     [
@@ -50,23 +54,29 @@ class Variant(NamedTuple):
     background: tuple[float, float]
     foreground: tuple[float, float]
     accent_bounds: tuple[float, float]
-    fallback: tuple[float, ...]
+    rich_lightness: tuple[float, ...]
+    rich_chroma: tuple[float, ...]
+    brown_step: float
 
 
 VARIANTS = {
     "dark": Variant(
         sign=1.0,
-        background=(0.28, 0.16),
-        foreground=(0.92, 0.985),
-        accent_bounds=(0.60, 0.88),
-        fallback=(0.66, 0.74, 0.85, 0.78, 0.78, 0.70, 0.70),
+        background=(0.27, 0.17),
+        foreground=(0.93, 0.985),
+        accent_bounds=(0.60, 0.93),
+        rich_lightness=(0.66, 0.74, 0.81, 0.75, 0.75, 0.70, 0.70),
+        rich_chroma=(0.160, 0.131, 0.127, 0.128, 0.097, 0.110, 0.128),
+        brown_step=0.12,
     ),
     "light": Variant(
         sign=-1.0,
-        background=(0.94, 0.99),
-        foreground=(0.30, 0.14),
+        background=(0.95, 0.99),
+        foreground=(0.30, 0.16),
         accent_bounds=(0.42, 0.60),
-        fallback=(0.54, 0.56, 0.54, 0.52, 0.52, 0.48, 0.48),
+        rich_lightness=(0.57, 0.62, 0.65, 0.60, 0.62, 0.56, 0.57),
+        rich_chroma=(0.161, 0.138, 0.127, 0.119, 0.096, 0.123, 0.145),
+        brown_step=0.04,
     ),
 }
 
@@ -93,17 +103,26 @@ def _tint(pixels: Array) -> tuple[float, float]:
     return float(hue % 360.0), float(weight.mean())
 
 
-def build_palette(lch: Array, contrast: float, variant: Variant) -> dict[str, str]:
+def build_palette(
+    lch: Array,
+    contrast: float = 0.5,
+    variant: Variant = VARIANTS["dark"],
+    richness: float = DEFAULT_RICHNESS,
+) -> dict[str, str]:
     if not 0.0 <= contrast <= 1.0:
         raise ValueError("contrast must be between 0.0 and 1.0")
+    if not 0.0 <= richness <= 1.0:
+        raise ValueError("richness must be between 0.0 and 1.0")
     sign = variant.sign
 
     vivid = lch[lch[:, 1] >= VIVID_CHROMA]
     hues = SLOT_HUES.copy()
     shares = np.zeros(NUM_SLOTS)
     found = np.zeros(NUM_SLOTS, dtype=bool)
-    slot_lightness = np.array(variant.fallback)
-    slot_chroma = np.full(NUM_SLOTS, FALLBACK_CHROMA)
+    rich_lightness = np.array(variant.rich_lightness)
+    rich_chroma = np.array(variant.rich_chroma)
+    slot_lightness = rich_lightness.copy()
+    slot_chroma = rich_chroma.copy()
 
     if len(vivid):
         offset = wrap_degrees(vivid[:, 2, None] - SLOT_HUES)
@@ -121,39 +140,56 @@ def build_palette(lch: Array, contrast: float, variant: Variant) -> dict[str, st
             hues[k] = SLOT_HUES[k] + np.average(
                 offset[members, k], weights=vivid[members, 1]
             )
-            slot_lightness[k] = vivid[members, 0].mean()
-            slot_chroma[k] = vivid[members, 1].mean()
+            slot_lightness[k] = np.percentile(vivid[members, 0], TONE_PERCENTILE)
+            slot_chroma[k] = np.percentile(vivid[members, 1], TONE_PERCENTILE)
             found[k] = True
 
     if found.any():
-        dominant = hues[shares.argmax()]
+        shift_lightness = np.median((slot_lightness - rich_lightness)[found])
+        shift_chroma = np.median((slot_chroma - rich_chroma)[found])
+        histogram, _ = np.histogram(
+            vivid[:, 2], bins=72, range=(0.0, 360.0), weights=vivid[:, 1]
+        )
+        present = (
+            np.flatnonzero(histogram >= PRESENT_SHARE * histogram.sum()) + 0.5
+        ) * 5.0
         for k in np.flatnonzero(~found):
-            turn = np.clip(
-                0.5 * wrap_degrees(dominant - SLOT_HUES[k]), -HARMONIZE, HARMONIZE
+            gap = wrap_degrees(present - SLOT_HUES[k])
+            toward = gap[np.abs(gap).argmin()]
+            hues[k] = SLOT_HUES[k] + np.clip(
+                toward, -REACH * _GAP_BELOW[k] / 2.0, REACH * _GAP_ABOVE[k] / 2.0
             )
-            hues[k] = SLOT_HUES[k] + turn
-            slot_lightness[k] = np.median(slot_lightness[found])
-            slot_chroma[k] = np.median(slot_chroma[found])
+            slot_lightness[k] = rich_lightness[k] + shift_lightness
+            slot_chroma[k] = rich_chroma[k] + shift_chroma
 
-    for _ in range(3):
+    for _ in range(NUM_SLOTS):
         for k in range(NUM_SLOTS):
             j = (k + 1) % NUM_SLOTS
-            gap = (hues[j] - hues[k]) % 360.0
+            gap = hues[j] - hues[k] + (360.0 if j == 0 else 0.0)
             if gap < MIN_SEPARATION:
                 if shares[k] < shares[j]:
                     hues[k] -= MIN_SEPARATION - gap
                 else:
                     hues[j] += MIN_SEPARATION - gap
-
     hues %= 360.0
+
     shift = sign * CONTRAST_SHIFT * (contrast - 0.5)
+    lightness_gap = slot_lightness - rich_lightness
+    chroma_gap = slot_chroma - rich_chroma
+    lightness = rich_lightness + np.where(
+        sign * lightness_gap > 0, lightness_gap, (1.0 - richness) * lightness_gap
+    )
+    chroma = rich_chroma + np.where(
+        chroma_gap > 0, chroma_gap, (1.0 - richness) * chroma_gap
+    )
+
     accents = np.empty((8, 3))
-    accents[:7, 0] = np.clip(slot_lightness + shift, *variant.accent_bounds)
-    accents[:7, 1] = np.clip(slot_chroma, *ACCENT_CHROMA)
+    accents[:7, 0] = np.clip(lightness + shift, *variant.accent_bounds)
+    accents[:7, 1] = np.clip(chroma, *ACCENT_CHROMA)
     accents[:7, 2] = hues
     accents[7] = (
-        np.clip(accents[1, 0] - sign * BROWN_STEP, *variant.accent_bounds),
-        np.clip(0.5 * accents[1, 1], 0.04, 0.09),
+        np.clip(accents[1, 0] - variant.brown_step, *variant.accent_bounds),
+        BROWN_CHROMA * accents[1, 1],
         hues[0] + wrap_degrees(hues[1] - hues[0]) / 2.0,
     )
 
@@ -186,10 +222,9 @@ def build_palette(lch: Array, contrast: float, variant: Variant) -> dict[str, st
         toward=(1.0 + sign) / 2.0,
         headroom=HEADROOM,
     )
-
     colors[:8, 0] = sign * np.maximum.accumulate(sign * colors[:8, 0])
-    rgb = oklch_to_srgb(colors)
 
+    rgb = oklch_to_srgb(colors)
     return {f"base{i:02X}": rgb[i].tobytes().hex() for i in range(16)}
 
 
@@ -198,6 +233,9 @@ def generate_palette(
     *,
     contrast: float = 0.5,
     variant: str = "dark",
+    richness: float = DEFAULT_RICHNESS,
     resize: int = 256,
 ) -> dict[str, str]:
-    return build_palette(load_oklch(Path(path), resize), contrast, VARIANTS[variant])
+    return build_palette(
+        load_oklch(Path(path), resize), contrast, VARIANTS[variant], richness
+    )

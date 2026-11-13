@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from typing import Final
-
 import numpy as np
 
 from .color import Array
 from .variants import Variant
 
-RAMP: Final = np.array([0.0, 0.08, 0.19, 0.38, 0.62, 0.82, 0.92, 1.0])
-NUM_NEUTRALS: Final = len(RAMP)
-HALF: Final = NUM_NEUTRALS // 2
+RAMP = np.array([0.0, 0.08, 0.19, 0.38, 0.62, 0.82, 0.92, 1.0])
+NUM_NEUTRALS = len(RAMP)
+HALF = NUM_NEUTRALS // 2
 
-TINT: Final = 1.0
-CHROMA_CAP: Final = np.repeat([0.045, 0.035], HALF)
+TINT = 0.7
+CHROMA_CAP = np.repeat([0.04, 0.025], HALF)
+CONTRAST_SPREAD = 0.1
+MIN_SPAN = 0.62
 
 
 def _tint(pixels: Array) -> tuple[float, float]:
@@ -30,18 +30,29 @@ def _split_by_lightness(lch: Array, sign: float) -> tuple[Array, Array]:
     return lch[relative <= 0.0], foreground if len(foreground) else lch
 
 
-def _lightness_ramp(variant: Variant, contrast: float) -> Array:
-    low = np.interp(contrast, [0.0, 1.0], variant.background)
-    high = np.interp(contrast, [0.0, 1.0], variant.foreground)
-    return low + (high - low) * RAMP
+def _end_of_ramp(pixels: Array, bounds: tuple[float, float], shift: float) -> float:
+    start, stop = bounds
+    tone = np.median(pixels[:, 0])
+    return float(np.clip(start + (stop - start) * tone + shift, start, stop))
 
 
 def neutral_colors(lch: Array, variant: Variant, contrast: float) -> Array:
-    background, foreground = (
-        _tint(side) for side in _split_by_lightness(lch, variant.sign)
+    shadows, highlights = _split_by_lightness(lch, variant.sign)
+    nudge = variant.sign * CONTRAST_SPREAD * (contrast - 0.5)
+    low = _end_of_ramp(shadows, variant.background_bounds, -nudge)
+    high = _end_of_ramp(highlights, variant.foreground_bounds, nudge)
+    high = low + variant.sign * max(variant.sign * (high - low), MIN_SPAN)
+
+    (shadow_hue, shadow_chroma), (highlight_hue, highlight_chroma) = (
+        _tint(shadows),
+        _tint(highlights),
     )
-    hue = np.repeat([background[0], foreground[0]], HALF)
-    chroma = np.repeat([background[1], foreground[1]], HALF)
     return np.column_stack(
-        [_lightness_ramp(variant, contrast), np.minimum(TINT * chroma, CHROMA_CAP), hue]
+        [
+            low + (high - low) * RAMP,
+            np.minimum(
+                TINT * np.repeat([shadow_chroma, highlight_chroma], HALF), CHROMA_CAP
+            ),
+            np.repeat([shadow_hue, highlight_hue], HALF),
+        ]
     )

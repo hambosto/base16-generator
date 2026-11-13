@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import overload
+from typing import TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +9,7 @@ from numpy.typing import NDArray
 Array = NDArray[np.float64]
 Rgb = NDArray[np.uint8]
 Mask = NDArray[np.bool_]
+Angle = TypeVar("Angle", float, Array)
 
 GAMUT_TOLERANCE = 1e-4
 BISECTIONS = 20
@@ -30,8 +31,11 @@ _LMS_TO_LAB = np.array(
 )
 _LMS_TO_RGB = np.linalg.inv(_RGB_TO_LMS)
 _LAB_TO_LMS = np.linalg.inv(_LMS_TO_LAB)
-
 _LUMA = np.array([0.2126, 0.7152, 0.0722])
+
+
+def wrap_degrees(angle: Angle) -> Angle:
+    return (angle + 180.0) % 360.0 - 180.0
 
 
 def _decode_srgb(rgb: Rgb) -> Array:
@@ -47,14 +51,6 @@ def _encode_srgb(linear: Array) -> Rgb:
         linear <= 0.0031308, linear * 12.92, 1.055 * linear ** (1.0 / 2.4) - 0.055
     )
     return np.rint(encoded * 255.0).astype(np.uint8)
-
-
-@overload
-def wrap_degrees(angle: Array) -> Array: ...
-@overload
-def wrap_degrees(angle: float) -> float: ...
-def wrap_degrees(angle: Array | float) -> Array | float:
-    return (angle + 180.0) % 360.0 - 180.0
 
 
 def srgb_to_oklch(rgb: Rgb) -> Array:
@@ -117,7 +113,7 @@ def _cap_chroma(colors: Array, headroom: float) -> Array:
     return capped
 
 
-def _search_lightness(
+def _nearest_passing_lightness(
     colors: Array, toward: float, passes: Callable[[Array], Mask]
 ) -> Array:
     near = colors[:, 0].copy()
@@ -149,10 +145,9 @@ def enforce_contrast(
     if not short.any():
         return colors
 
-    lightness = _search_lightness(
+    lightness = _nearest_passing_lightness(
         colors, toward, lambda trial: passes(_cap_chroma(trial, headroom))
     )
-    
     fixed = colors.copy()
     fixed[short, 0] = lightness[short]
     return _cap_chroma(fixed, headroom)

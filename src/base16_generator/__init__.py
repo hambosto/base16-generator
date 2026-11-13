@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from .color import oklch_to_srgb, srgb_to_oklch
 from .image import load_oklch
 from .palette import build_palette, generate_palette

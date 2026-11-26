@@ -7,17 +7,19 @@ terminal theme.
 
 ## Install
 
-Needs [uv](https://docs.astral.sh/uv/) and Python 3.14+. From a checkout of
-this repo:
+Needs Python 3.14+. From a checkout of this repo:
 
 ```sh
-uv tool install .
+python3.14 -m venv .venv
+source .venv/bin/activate
+pip install .
 ```
 
 Or run it without installing:
 
 ```sh
-uv run base16-generator -i wallpaper.png
+pip install -e .
+base16-generator -i wallpaper.png
 ```
 
 ## Usage
@@ -30,18 +32,18 @@ Prints the scheme as JSON to stdout:
 
 ```json
 {
-  "scheme": "wallpaper",
-  "author": "Base16 Generator (https://github.com/hambosto/base16-generator)",
+  "scheme": "dark",
+  "author": "base16-generator",
   "base00": "1A1B26",
   "base01": "...",
   "base0F": "..."
 }
 ```
 
-Use `-o` to write a file and `-n` to set the scheme name:
+Use `-o` to write a file instead of printing it:
 
 ```sh
-base16-generator -i wallpaper.png -v light -c 0.7 -s 0.6 -n "My Theme" -o my-theme.json
+base16-generator -i wallpaper.png -v light -c 0.7 -o my-theme.json
 ```
 
 Flags:
@@ -50,26 +52,24 @@ Flags:
 -i, --image       image to read (required)
 -v, --variant     dark or light (default: dark)
 -c, --contrast    0.0 to 1.0 (default: 0.5)
--s, --richness    0.0 to 1.0 (default: 0.8)
--n, --name        scheme name (default: image filename)
--r, --resize      downscale before sampling (default: 256)
+-r, --resize      cap the longest side before sampling (default: 256)
 -o, --output      write to file instead of stdout
 ```
 
 - `--contrast` shifts accent lightness and widens the neutral ramp; higher
   values push the palette further apart.
-- `--richness` blends sampled accent lightness and chroma toward the values
-  of well-known schemes: `0.0` keeps the image's own tones, `1.0` uses the
-  typical values.
+- `--variant` sets which side of the ramp is the background. The `scheme`
+  field in the output is the variant, `"dark"` or `"light"`.
+- Images larger than 100 megapixels are rejected with a one-line error.
+  An embedded ICC profile, if present, is converted to sRGB first;
+  a corrupt profile falls back to the raw pixel values.
 
 ### As a library
 
 ```python
 from base16_generator import generate_palette
 
-palette = generate_palette(
-    "wallpaper.png", variant="light", contrast=0.7, richness=0.6
-)
+palette = generate_palette("wallpaper.png", variant="light", contrast=0.7)
 ```
 
 This returns a dict mapping `base00`–`base0F` to lowercase hex strings without
@@ -89,6 +89,10 @@ palette = build_palette(
 ## Development
 
 ```sh
-uv sync    # install dependencies
-uv build   # build sdist and wheel
+python3.14 -m venv .venv   # create the virtual environment
+source .venv/bin/activate  # use it
+pip install -e ".[dev]"    # install the package plus lint tools
+ruff check src/
+ruff format --check src/
+mypy src/                  # strict
 ```

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,7 +8,6 @@ from numpy.typing import NDArray
 Array = NDArray[np.float64]
 Rgb = NDArray[np.uint8]
 Mask = NDArray[np.bool_]
-Angle = TypeVar("Angle", float, Array)
 
 GAMUT_TOLERANCE = 1e-4
 BISECTIONS = 20
@@ -34,18 +32,34 @@ _LAB_TO_LMS = np.linalg.inv(_LMS_TO_LAB)
 _LUMA = np.array([0.2126, 0.7152, 0.0722])
 
 
-def wrap_degrees(angle: Angle) -> Angle:
+def wrap_degrees[Angle: (float, Array)](angle: Angle) -> Angle:
     return (angle + 180.0) % 360.0 - 180.0
 
 
-def _decode_srgb(rgb: Rgb) -> Array:
+def circular_mean(angles: Array, weights: Array) -> float:
+    rad = np.radians(angles)
+    return float(
+        np.degrees(
+            np.arctan2((weights * np.sin(rad)).sum(), (weights * np.cos(rad)).sum())
+        )
+        % 360.0
+    )
+
+
+def adjacent_min(lab: Array) -> float:
+    return min(
+        float(np.sqrt(((lab[k] - lab[k + 1]) ** 2).sum())) for k in range(len(lab) - 1)
+    )
+
+
+def decode_srgb(rgb: Rgb) -> Array:
     encoded = rgb / 255.0
     return np.where(
         encoded <= 0.04045, encoded / 12.92, ((encoded + 0.055) / 1.055) ** 2.4
     )
 
 
-def _encode_srgb(linear: Array) -> Rgb:
+def encode_srgb(linear: Array) -> Rgb:
     linear = np.clip(linear, 0.0, 1.0)
     encoded = np.where(
         linear <= 0.0031308, linear * 12.92, 1.055 * linear ** (1.0 / 2.4) - 0.055
@@ -54,7 +68,7 @@ def _encode_srgb(linear: Array) -> Rgb:
 
 
 def srgb_to_oklch(rgb: Rgb) -> Array:
-    lab = np.cbrt(_decode_srgb(rgb) @ _RGB_TO_LMS.T) @ _LMS_TO_LAB.T
+    lab = np.cbrt(decode_srgb(rgb) @ _RGB_TO_LMS.T) @ _LMS_TO_LAB.T
     lightness, a, b = np.moveaxis(lab, -1, 0)
     hue = np.degrees(np.arctan2(b, a)) % 360.0
     return np.stack([lightness, np.hypot(a, b), hue], axis=-1)
@@ -92,11 +106,11 @@ def oklch_to_srgb(lch: Array) -> Rgb:
     colors = np.array(lch, dtype=np.float64)
     colors[..., 0] = np.clip(colors[..., 0], 0.0, 1.0)
     colors[..., 1] = np.clip(colors[..., 1], 0.0, max_chroma(colors))
-    return _encode_srgb(_oklch_to_linear(colors))
+    return encode_srgb(_oklch_to_linear(colors))
 
 
 def relative_luminance(rgb: Rgb) -> Array:
-    luminance: Array = _decode_srgb(rgb) @ _LUMA
+    luminance: Array = decode_srgb(rgb) @ _LUMA
     return luminance
 
 
